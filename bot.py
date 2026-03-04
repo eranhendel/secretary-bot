@@ -46,7 +46,7 @@ def parse_time_from_text(text: str):
         return h, 0
     return None
 
-def parse_free_date(text: str) -> datetime | None:
+def parse_free_date(text: str):
     """Parse a free-form Hebrew/English date string into a localized datetime."""
     now = now_israel()
     text_lower = text.strip().lower()
@@ -417,4 +417,67 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ לא נמצאה משימה #{task_id}")
 
-# ─── Reminder checker ────────────────────────────────────
+# ─── Reminder checker ────────────────────────────────────────────────────────
+
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    tasks = load_tasks()
+    now = now_israel()
+    changed = False
+
+    for t in tasks:
+        if t.get("done") or t.get("reminded") or not t.get("reminder"):
+            continue
+        reminder_time = datetime.fromisoformat(t["reminder"])
+        if reminder_time.tzinfo is None:
+            reminder_time = ISRAEL_TZ.localize(reminder_time)
+        if now >= reminder_time:
+            keyboard = [[
+                InlineKeyboardButton("✅ בוצע", callback_data=f"done_{t['id']}"),
+                InlineKeyboardButton("⏰ תזכיר שוב בשעה", callback_data="remind_1h")
+            ]]
+            await context.bot.send_message(
+                chat_id=context.job.chat_id,
+                text=f"🔔 *תזכורת!*\n\n📌 {t['text']}",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+            t["reminded"] = True
+            changed = True
+
+    if changed:
+        save_tasks(tasks)
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not token:
+        raise ValueError("❌ חסר TELEGRAM_BOT_TOKEN בסביבה!")
+    if not chat_id:
+        raise ValueError("❌ חסר TELEGRAM_CHAT_ID בסביבה!")
+
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("add", add_task))
+    app.add_handler(CommandHandler("list", list_tasks))
+    app.add_handler(CommandHandler("done", done_cmd))
+    app.add_handler(CommandHandler("delete", delete_cmd))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.job_queue.run_repeating(
+        check_reminders,
+        interval=10,
+        first=5,
+        chat_id=int(chat_id)
+    )
+
+    print("🤖 הבוט עלה! מאזין להודעות...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
