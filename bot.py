@@ -91,6 +91,49 @@ def hour_picker_keyboard(selected_date: str):
     buttons.append([InlineKeyboardButton("🔙 חזור לבחירת יום", callback_data="remind_pick")])
     return InlineKeyboardMarkup(buttons)
 
+# ─── Smart date parsing via Claude API ───────────────────────────────────────
+
+import urllib.request
+
+async def parse_date_with_claude(user_input: str) -> datetime | None:
+    """Send the user's free-text date to Claude and get back a parsed datetime."""
+    today = now_israel().strftime("%d/%m/%Y")
+    prompt = (
+        f"היום הוא {today}. "
+        f"המשתמש רוצה תזכורת בתאריך/שעה הבאים: \"{user_input}\". "
+        "החזר JSON בלבד, בלי שום טקסט נוסף, בפורמט: "
+        "{\"datetime\": \"YYYY-MM-DD HH:MM\"} "
+        "אם לא ניתן להבין את התאריך, החזר: {\"datetime\": null}"
+    )
+
+    body = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": prompt}]
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            text = data["content"][0]["text"].strip()
+            parsed = json.loads(text)
+            if parsed.get("datetime"):
+                naive = datetime.strptime(parsed["datetime"], "%Y-%m-%d %H:%M")
+                return ISRAEL_TZ.localize(naive)
+    except Exception:
+        pass
+    return None
+
 # ─── Commands ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -131,13 +174,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state == "waiting_custom_time":
-        try:
-            naive_time = datetime.strptime(text, "%d/%m/%Y %H:%M")
-            reminder_time = ISRAEL_TZ.localize(naive_time)
+        reminder_time = await parse_date_with_claude(text)
+        if reminder_time:
             await _save_new_task(update, context, reminder_time)
-        except ValueError:
+        else:
             await update.message.reply_text(
-                "❌ פורמט לא תקין. אנא הזן בפורמט: `DD/MM/YYYY HH:MM`\nלדוגמה: `25/12/2025 09:00`",
+                "❌ לא הצלחתי להבין את התאריך 🤔\n\n"
+                "נסה לכתוב בצורה אחרת, לדוגמה:\n"
+                "• `4 במרץ 2026 09:30`\n"
+                "• `4.3.2026 09:30`\n"
+                "• `4/3/2026 9:30`\n"
+                "• `מחרתיים ב-10 בבוקר`",
                 parse_mode="Markdown"
             )
         return
@@ -183,7 +230,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "remind_custom":
             context.user_data["state"] = "waiting_custom_time"
             await query.edit_message_text(
-                "✍️ הזן תאריך ושעה בפורמט:\n`DD/MM/YYYY HH:MM`\nלדוגמה: `25/12/2025 09:35`",
+                "✍️ *כתוב תאריך ושעה בכל פורמט שנוח לך:*\n\n"
+                "• `4 במרץ 2026 09:30`\n"
+                "• `4.3.2026 09:30`\n"
+                "• `4/3/2026 9:30`\n"
+                "• `מחרתיים ב-10 בבוקר`\n"
+                "• `יום שני ב-14:30`",
                 parse_mode="Markdown"
             )
         return
@@ -366,7 +418,7 @@ def main():
 
     app.job_queue.run_repeating(
         check_reminders,
-        interval=60,
+        interval=10,
         first=10,
         chat_id=int(chat_id)
     )
