@@ -1,14 +1,20 @@
 import os
 import json
-import asyncio
 from datetime import datetime, timedelta
+import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# ─── Storage (JSON file) ───────────────────────────────────────────────────────
+# ─── Timezone ─────────────────────────────────────────────────────────────────
+ISRAEL_TZ = pytz.timezone("Asia/Jerusalem")
+
+def now_israel():
+    return datetime.now(ISRAEL_TZ)
+
+# ─── Storage ──────────────────────────────────────────────────────────────────
 TASKS_FILE = "tasks.json"
 
 def load_tasks():
@@ -23,6 +29,67 @@ def save_tasks(tasks):
 
 def get_next_id(tasks):
     return max((t["id"] for t in tasks), default=0) + 1
+
+# ─── Keyboards ────────────────────────────────────────────────────────────────
+
+def quick_reminder_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏰ בעוד שעה", callback_data="remind_1h"),
+         InlineKeyboardButton("🌅 מחר בבוקר (9:00)", callback_data="remind_tomorrow")],
+        [InlineKeyboardButton("📅 בעוד שבוע", callback_data="remind_week"),
+         InlineKeyboardButton("🗓 בחר תאריך ושעה", callback_data="remind_pick")],
+        [InlineKeyboardButton("✍️ הזנה ידנית", callback_data="remind_custom"),
+         InlineKeyboardButton("🚫 בלי תזכורת", callback_data="remind_none")],
+    ])
+
+def day_picker_keyboard():
+    now = now_israel()
+    days_he = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+    buttons = []
+    row = []
+    for i in range(7):
+        day = now + timedelta(days=i)
+        if i == 0:
+            label = "היום"
+        elif i == 1:
+            label = "מחר"
+        else:
+            label = f"יום {days_he[day.weekday()]}"
+        date_str = day.strftime("%d/%m")
+        row.append(InlineKeyboardButton(
+            f"{label} {date_str}",
+            callback_data=f"day_{day.strftime('%Y-%m-%d')}"
+        ))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+def hour_picker_keyboard(selected_date: str):
+    """Slots every 30 minutes from 07:00 to 22:30"""
+    buttons = []
+    row = []
+    hour = 7
+    minute = 0
+    while hour < 23:
+        label = f"{hour:02d}:{minute:02d}"
+        row.append(InlineKeyboardButton(
+            label,
+            callback_data=f"slot_{selected_date}_{hour:02d}{minute:02d}"
+        ))
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+        minute += 30
+        if minute == 60:
+            minute = 0
+            hour += 1
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("🔙 חזור לבחירת יום", callback_data="remind_pick")])
+    return InlineKeyboardMarkup(buttons)
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
 
@@ -43,7 +110,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start the add-task flow"""
     await update.message.reply_text(
         "📝 *מה המשימה?*\nכתוב את תיאור המשימה:",
         parse_mode="Markdown"
@@ -54,30 +120,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state")
     text = update.message.text.strip()
 
-    # ── Flow: waiting for task text ──
     if state == "waiting_task_text":
         context.user_data["new_task_text"] = text
         context.user_data["state"] = "waiting_reminder_time"
-
-        keyboard = [
-            [InlineKeyboardButton("⏰ בעוד שעה", callback_data="remind_1h"),
-             InlineKeyboardButton("🌅 מחר בבוקר (9:00)", callback_data="remind_tomorrow")],
-            [InlineKeyboardButton("📅 בעוד שבוע", callback_data="remind_week"),
-             InlineKeyboardButton("✍️ הזן שעה ידנית", callback_data="remind_custom")],
-            [InlineKeyboardButton("🚫 בלי תזכורת", callback_data="remind_none")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
             f"✅ שמרתי: *{text}*\n\nמתי להזכיר לך?",
-            reply_markup=reply_markup,
+            reply_markup=quick_reminder_keyboard(),
             parse_mode="Markdown"
         )
         return
 
-    # ── Flow: waiting for custom reminder time ──
     if state == "waiting_custom_time":
         try:
-            reminder_time = datetime.strptime(text, "%d/%m/%Y %H:%M")
+            naive_time = datetime.strptime(text, "%d/%m/%Y %H:%M")
+            reminder_time = ISRAEL_TZ.localize(naive_time)
             await _save_new_task(update, context, reminder_time)
         except ValueError:
             await update.message.reply_text(
@@ -86,21 +142,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ── No state: treat as new task directly ──
+    # הודעה רגילה = משימה חדשה
     context.user_data["new_task_text"] = text
     context.user_data["state"] = "waiting_reminder_time"
-
-    keyboard = [
-        [InlineKeyboardButton("⏰ בעוד שעה", callback_data="remind_1h"),
-         InlineKeyboardButton("🌅 מחר בבוקר (9:00)", callback_data="remind_tomorrow")],
-        [InlineKeyboardButton("📅 בעוד שבוע", callback_data="remind_week"),
-         InlineKeyboardButton("✍️ הזן שעה ידנית", callback_data="remind_custom")],
-        [InlineKeyboardButton("🚫 בלי תזכורת", callback_data="remind_none")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         f"📌 הוספתי משימה: *{text}*\n\nמתי להזכיר לך?",
-        reply_markup=reply_markup,
+        reply_markup=quick_reminder_keyboard(),
         parse_mode="Markdown"
     )
 
@@ -109,31 +156,62 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    # ── Reminder time selection ──
+    # ── בחירה מהירה ──
     if data.startswith("remind_"):
-        now = datetime.now()
-        reminder_time = None
+        now = now_israel()
 
         if data == "remind_1h":
-            reminder_time = now + timedelta(hours=1)
+            await _save_new_task(query, context, now + timedelta(hours=1))
+
         elif data == "remind_tomorrow":
-            reminder_time = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0)
+            t = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+            await _save_new_task(query, context, t)
+
         elif data == "remind_week":
-            reminder_time = now + timedelta(weeks=1)
+            await _save_new_task(query, context, now + timedelta(weeks=1))
+
         elif data == "remind_none":
-            reminder_time = None
+            await _save_new_task(query, context, None)
+
+        elif data == "remind_pick":
+            await query.edit_message_text(
+                "🗓 *בחר יום:*",
+                reply_markup=day_picker_keyboard(),
+                parse_mode="Markdown"
+            )
+
         elif data == "remind_custom":
             context.user_data["state"] = "waiting_custom_time"
             await query.edit_message_text(
-                "📅 הזן תאריך ושעה בפורמט:\n`DD/MM/YYYY HH:MM`\nלדוגמה: `25/12/2025 09:00`",
+                "✍️ הזן תאריך ושעה בפורמט:\n`DD/MM/YYYY HH:MM`\nלדוגמה: `25/12/2025 09:35`",
                 parse_mode="Markdown"
             )
-            return
+        return
 
+    # ── בחירת יום ──
+    if data.startswith("day_"):
+        selected_date = data[4:]  # YYYY-MM-DD
+        await query.edit_message_text(
+            f"⏰ *בחר שעה:*",
+            reply_markup=hour_picker_keyboard(selected_date),
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── בחירת שעה (slot) ──
+    if data.startswith("slot_"):
+        # slot_YYYY-MM-DD_HHMM
+        parts = data.split("_")
+        selected_date = parts[1]   # YYYY-MM-DD
+        time_str = parts[2]        # HHMM
+        hour = int(time_str[:2])
+        minute = int(time_str[2:])
+        naive_time = datetime.strptime(selected_date, "%Y-%m-%d").replace(hour=hour, minute=minute, second=0)
+        reminder_time = ISRAEL_TZ.localize(naive_time)
         await _save_new_task(query, context, reminder_time)
         return
 
-    # ── Done / Delete from list ──
+    # ── בוצע / מחק ──
     if data.startswith("done_"):
         task_id = int(data.split("_")[1])
         tasks = load_tasks()
@@ -147,21 +225,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("delete_"):
         task_id = int(data.split("_")[1])
-        tasks = load_tasks()
-        tasks = [t for t in tasks if t["id"] != task_id]
+        tasks = [t for t in load_tasks() if t["id"] != task_id]
         save_tasks(tasks)
         await query.edit_message_text(f"🗑 משימה #{task_id} נמחקה.")
         return
 
 async def _save_new_task(source, context, reminder_time):
-    """Save task to JSON and schedule reminder"""
     tasks = load_tasks()
     task_text = context.user_data.get("new_task_text", "משימה ללא כותרת")
     task = {
         "id": get_next_id(tasks),
         "text": task_text,
         "done": False,
-        "created": datetime.now().isoformat(),
+        "created": now_israel().isoformat(),
         "reminder": reminder_time.isoformat() if reminder_time else None,
         "reminded": False
     }
@@ -171,7 +247,7 @@ async def _save_new_task(source, context, reminder_time):
 
     msg = f"🎉 *משימה נוספה בהצלחה!*\n\n📌 {task_text}\n"
     if reminder_time:
-        msg += f"⏰ תזכורת: {reminder_time.strftime('%d/%m/%Y %H:%M')}"
+        msg += f"⏰ תזכורת: {reminder_time.strftime('%d/%m/%Y %H:%M')} (שעון ישראל)"
     else:
         msg += "🚫 ללא תזכורת"
 
@@ -236,25 +312,26 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ לא נמצאה משימה #{task_id}")
 
-# ─── Reminder checker (runs every minute) ────────────────────────────────────
+# ─── Reminder checker ────────────────────────────────────────────────────────
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     tasks = load_tasks()
-    now = datetime.now()
+    now = now_israel()
     changed = False
 
     for t in tasks:
         if t.get("done") or t.get("reminded") or not t.get("reminder"):
             continue
         reminder_time = datetime.fromisoformat(t["reminder"])
+        if reminder_time.tzinfo is None:
+            reminder_time = ISRAEL_TZ.localize(reminder_time)
         if now >= reminder_time:
-            chat_id = context.job.chat_id
             keyboard = [[
                 InlineKeyboardButton("✅ בוצע", callback_data=f"done_{t['id']}"),
-                InlineKeyboardButton("⏰ תזכיר שוב בשעה", callback_data=f"remind_1h")
+                InlineKeyboardButton("⏰ תזכיר שוב בשעה", callback_data="remind_1h")
             ]]
             await context.bot.send_message(
-                chat_id=chat_id,
+                chat_id=context.job.chat_id,
                 text=f"🔔 *תזכורת!*\n\n📌 {t['text']}",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown"
@@ -278,7 +355,6 @@ def main():
 
     app = Application.builder().token(token).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("add", add_task))
@@ -288,7 +364,6 @@ def main():
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Reminder job — every 60 seconds
     app.job_queue.run_repeating(
         check_reminders,
         interval=60,
